@@ -6,6 +6,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { EmailCard } from "@/components/email-card";
 import { Inbox } from "@/components/inbox/inbox";
 import { MessageViewer } from "@/components/message-viewer/message-viewer";
+import { Button } from "@/components/ui/button";
 import { ProvisioningState } from "@/components/provisioning-state";
 import { useGenerateNewAccount, useProvisionAccount } from "@/hooks/use-account";
 import { useMessages } from "@/hooks/use-messages";
@@ -38,16 +39,45 @@ export function Workspace() {
   const setSelectedId = useSelectionStore((s) => s.setSelectedId);
   const addressRef = React.useRef<HTMLElement | null>(null);
 
-  // Provision the first inbox automatically on first visit.
+  // Stable reference to the mutate function so provisioning effects don't
+  // re-fire every render (the mutation object changes identity each render).
+  const provisionMutate = React.useCallback(
+    (signal: AbortSignal) =>
+      provision.mutateAsync(signal).catch(() => {
+        /* error surfaced via store */
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  // Auto-provision the first inbox on mount, with a capped retry-on-failure
+  // loop so a transient mail.tm error doesn't leave the user stuck on
+  // "Generating…" forever. Runs once; subsequent retries are scheduled inside.
   React.useEffect(() => {
-    if (status === "idle" && !account) {
-      const controller = new AbortController();
-      void provision.mutateAsync(controller.signal).catch(() => {
-        /* error already surfaced via store */
-      });
-      return () => controller.abort();
-    }
-  }, [status, account, provision]);
+    if (account) return;
+    const controller = new AbortController();
+    let attempts = 0;
+    let timer: ReturnType<typeof setTimeout>;
+
+    const tryProvision = async () => {
+      attempts += 1;
+      try {
+        await provisionMutate(controller.signal);
+      } catch {
+        // Schedule a backoff retry (cap at 4 attempts) so the UI isn't stuck.
+        if (attempts < 4 && !controller.signal.aborted) {
+          timer = setTimeout(tryProvision, 1500 * attempts);
+        }
+      }
+    };
+
+    void tryProvision();
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Re-provision automatically if the session expired (401).
   React.useEffect(() => {
@@ -58,10 +88,10 @@ export function Workspace() {
       !provision.isPending
     ) {
       const controller = new AbortController();
-      void provision.mutateAsync(controller.signal).catch(() => {});
+      provisionMutate(controller.signal);
       return () => controller.abort();
     }
-  }, [status, error, provision]);
+  }, [status, error, provision.isPending, provisionMutate]);
 
   const handleGenerateNew = async () => {
     setSelectedId(null);
@@ -109,6 +139,12 @@ export function Workspace() {
 
   const isProvisioning = provision.isPending || status === "provisioning";
 
+  // Manual retry exposed when auto-provisioning ultimately fails.
+  const handleRetryProvision = () => {
+    const controller = new AbortController();
+    void provision.mutateAsync(controller.signal).catch(() => {});
+  };
+
   return (
     <div className="flex flex-col gap-6">
       <EmailCard
@@ -122,7 +158,12 @@ export function Workspace() {
         }}
       />
 
-      {status === "error" && !account ? (
+      {status === "error" && !account && !provision.isPending ? (
+        <ProvisionErrorState
+          message={error ?? undefined}
+          onRetry={handleRetryProvision}
+        />
+      ) : status === "error" && !account ? (
         <ProvisioningState message="Retrying…" />
       ) : !account ? (
         <ProvisioningState />
@@ -139,6 +180,47 @@ export function Workspace() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/** Error state with a manual retry button, shown when provisioning fails. */
+function ProvisionErrorState({
+  message,
+  onRetry,
+}: {
+  message?: string;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="flex flex-col items-center justify-center gap-4 rounded-2xl border border-destructive/30 bg-card/40 px-6 py-12 text-center backdrop-blur-xl">
+      <div className="flex h-12 w-12 items-center justify-center rounded-xl border border-destructive/30 bg-destructive/10">
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          className="h-5 w-5 text-destructive"
+          aria-hidden="true"
+        >
+          <path
+            d="M12 9v4m0 4h.01M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      </div>
+      <div className="space-y-1">
+        <p className="text-sm font-medium text-foreground">
+          Couldn&apos;t generate an inbox
+        </p>
+        <p className="mx-auto max-w-xs text-xs text-muted">
+          {message ?? "mail.tm is busy right now. Please try again."}
+        </p>
+      </div>
+      <Button onClick={onRetry} variant="outline" size="sm">
+        Try again
+      </Button>
     </div>
   );
 }
