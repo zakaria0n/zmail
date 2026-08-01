@@ -5,56 +5,47 @@ import { useQueryClient } from "@tanstack/react-query";
 
 import { EmailCard } from "@/components/email-card";
 import { Inbox } from "@/components/inbox/inbox";
+import { MailboxSidebar } from "@/components/mailbox/mailbox-sidebar";
 import { MessageViewer } from "@/components/message-viewer/message-viewer";
 import { Button } from "@/components/ui/button";
 import { ProvisioningState } from "@/components/provisioning-state";
-import { useGenerateNewAccount, useProvisionAccount } from "@/hooks/use-account";
+import { useProvisionMailbox } from "@/hooks/use-mailboxes";
 import { useMessages } from "@/hooks/use-messages";
 import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
 import { toast } from "@/hooks/use-toast";
+import { useCopy } from "@/hooks/use-copy";
 import { useSelectionStore } from "@/components/mobile-selection-bridge";
-import { useAccountStore } from "@/store/account-store";
+import { useMailboxStore } from "@/store/mailbox-store";
 import type { Message } from "@/types";
 
 /**
  * The main interactive workspace.
  *
- * Owns the selected-message state and wires together the email card, inbox
- * and message viewer. Also provisions the very first inbox on mount and binds
- * the global keyboard shortcuts.
+ * Three-column layout on desktop:
+ *   [mailbox sidebar] · [email card + inbox/viewer]
+ *
+ * Owns selection state, keyboard shortcuts and first-visit provisioning.
  */
 export function Workspace() {
-  const account = useAccountStore((s) => s.account);
-  const status = useAccountStore((s) => s.status);
-  const error = useAccountStore((s) => s.error);
+  const mailboxes = useMailboxStore((s) => s.mailboxes);
+  const activeMailbox = useMailboxStore((s) =>
+    s.mailboxes.find((m) => m.id === s.activeId),
+  );
+  const status = useMailboxStore((s) => s.status);
+  const error = useMailboxStore((s) => s.error);
 
-  const provision = useProvisionAccount();
-  const generateNew = useGenerateNewAccount();
+  const provision = useProvisionMailbox();
   const queryClient = useQueryClient();
-
-  // Pull `isFetching` for the inbox to drive the refresh spinner.
   const { isFetching, refetch } = useMessages();
+  const { copy } = useCopy();
 
   const selectedId = useSelectionStore((s) => s.selectedId);
   const setSelectedId = useSelectionStore((s) => s.setSelectedId);
   const addressRef = React.useRef<HTMLElement | null>(null);
 
-  // Stable reference to the mutate function so provisioning effects don't
-  // re-fire every render (the mutation object changes identity each render).
-  const provisionMutate = React.useCallback(
-    (signal: AbortSignal) =>
-      provision.mutateAsync(signal).catch(() => {
-        /* error surfaced via store */
-      }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [],
-  );
-
-  // Auto-provision the first inbox on mount, with a capped retry-on-failure
-  // loop so a transient mail.tm error doesn't leave the user stuck on
-  // "Generating…" forever. Runs once; subsequent retries are scheduled inside.
+  // Auto-provision the very first mailbox on mount, with a capped retry loop.
   React.useEffect(() => {
-    if (account) return;
+    if (mailboxes.length > 0) return;
     const controller = new AbortController();
     let attempts = 0;
     let timer: ReturnType<typeof setTimeout>;
@@ -62,9 +53,8 @@ export function Workspace() {
     const tryProvision = async () => {
       attempts += 1;
       try {
-        await provisionMutate(controller.signal);
+        await provision.mutateAsync(controller.signal);
       } catch {
-        // Schedule a backoff retry (cap at 4 attempts) so the UI isn't stuck.
         if (attempts < 4 && !controller.signal.aborted) {
           timer = setTimeout(tryProvision, 1500 * attempts);
         }
@@ -79,32 +69,18 @@ export function Workspace() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Re-provision automatically if the session expired (401).
-  React.useEffect(() => {
-    if (
-      status === "ready" &&
-      error &&
-      /session has expired|expired/i.test(error) &&
-      !provision.isPending
-    ) {
-      const controller = new AbortController();
-      provisionMutate(controller.signal);
-      return () => controller.abort();
-    }
-  }, [status, error, provision.isPending, provisionMutate]);
-
   const handleGenerateNew = async () => {
     setSelectedId(null);
     const controller = new AbortController();
     try {
-      const next = await generateNew.mutateAsync(controller.signal);
+      const next = await provision.mutateAsync(controller.signal);
       toast({
-        title: "New inbox ready",
+        title: "New mailbox ready",
         description: next.address,
         variant: "success",
       });
     } catch {
-      /* handled in store */
+      /* surfaced via store */
     }
   };
 
@@ -113,73 +89,100 @@ export function Workspace() {
     void queryClient.invalidateQueries();
   };
 
-  const handleSelect = (message: Message) => {
-    setSelectedId(message.id);
-  };
-
+  const handleSelect = (message: Message) => setSelectedId(message.id);
   const handleBack = () => setSelectedId(null);
 
+  // Keyboard shortcuts.
   useKeyboardShortcuts(
     {
-      r: (e) => {
-        e.preventDefault();
-        handleRefresh();
-      },
       n: (e) => {
         e.preventDefault();
         void handleGenerateNew();
+      },
+      r: (e) => {
+        e.preventDefault();
+        handleRefresh();
       },
       "/": (e) => {
         e.preventDefault();
         addressRef.current?.focus();
       },
     },
-    status === "ready",
+    true,
   );
+
+  // Cmd/Ctrl+C copies the active address (Shift variant copies password),
+  // but only when the user hasn't selected text (so normal copy still works).
+  React.useEffect(() => {
+    const handler = async (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "c") return;
+      const selection = window.getSelection?.()?.toString() ?? "";
+      if (selection.length > 0) return; // let the native copy win
+      const mailbox = useMailboxStore.getState().mailboxes.find(
+        (m) => m.id === useMailboxStore.getState().activeId,
+      );
+      if (!mailbox) return;
+      e.preventDefault();
+      if (e.shiftKey) {
+        if (await copy(mailbox.password))
+          toast({ title: "Password copied", variant: "success" });
+      } else {
+        if (await copy(mailbox.address))
+          toast({ title: "Address copied", variant: "success" });
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [copy]);
 
   const isProvisioning = provision.isPending || status === "provisioning";
 
-  // Manual retry exposed when auto-provisioning ultimately fails.
-  const handleRetryProvision = () => {
-    const controller = new AbortController();
-    void provision.mutateAsync(controller.signal).catch(() => {});
-  };
-
   return (
-    <div className="flex flex-col gap-6">
-      <EmailCard
-        address={account?.address ?? null}
-        isProvisioning={isProvisioning}
-        isRefreshing={isFetching}
-        onRefresh={handleRefresh}
-        onGenerate={handleGenerateNew}
-        registerAddressRef={(el) => {
-          addressRef.current = el;
-        }}
-      />
+    <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,300px)_minmax(0,1fr)]">
+      {/* Sidebar (desktop) */}
+      <div className="hidden h-[80vh] overflow-hidden rounded-2xl border border-border bg-card/40 shadow-card backdrop-blur-xl lg:block">
+        <MailboxSidebar className="h-full" />
+      </div>
 
-      {status === "error" && !account && !provision.isPending ? (
-        <ProvisionErrorState
-          message={error ?? undefined}
-          onRetry={handleRetryProvision}
+      {/* Main column */}
+      <div className="flex flex-col gap-6">
+        <EmailCard
+          address={activeMailbox?.address ?? null}
+          isProvisioning={isProvisioning}
+          isRefreshing={isFetching}
+          onRefresh={handleRefresh}
+          onGenerate={handleGenerateNew}
+          registerAddressRef={(el) => {
+            addressRef.current = el;
+          }}
         />
-      ) : status === "error" && !account ? (
-        <ProvisioningState message="Retrying…" />
-      ) : !account ? (
-        <ProvisioningState />
-      ) : (
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,380px)_minmax(0,1fr)]">
-          {/* Inbox */}
-          <div className="h-[70vh] overflow-hidden rounded-2xl border border-border bg-card/40 shadow-card backdrop-blur-xl lg:h-[72vh]">
-            <Inbox selectedId={selectedId} onSelect={handleSelect} />
-          </div>
 
-          {/* Viewer (desktop side panel) */}
-          <div className="hidden h-[72vh] overflow-hidden rounded-2xl border border-border bg-card/40 shadow-card backdrop-blur-xl lg:block">
-            <MessageViewer messageId={selectedId} onBack={handleBack} />
+        {status === "error" && mailboxes.length === 0 && !provision.isPending ? (
+          <ProvisionErrorState
+            message={error ?? undefined}
+            onRetry={() => {
+              const controller = new AbortController();
+              void provision.mutateAsync(controller.signal).catch(() => {});
+            }}
+          />
+        ) : mailboxes.length === 0 ? (
+          <ProvisioningState />
+        ) : !activeMailbox ? (
+          <ProvisioningState />
+        ) : (
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,380px)_minmax(0,1fr)]">
+            {/* Inbox */}
+            <div className="h-[64vh] overflow-hidden rounded-2xl border border-border bg-card/40 shadow-card backdrop-blur-xl xl:h-[66vh]">
+              <Inbox selectedId={selectedId} onSelect={handleSelect} />
+            </div>
+
+            {/* Viewer (desktop side panel) */}
+            <div className="hidden h-[66vh] overflow-hidden rounded-2xl border border-border bg-card/40 shadow-card backdrop-blur-xl xl:block">
+              <MessageViewer messageId={selectedId} onBack={handleBack} />
+            </div>
           </div>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 }
@@ -212,7 +215,7 @@ function ProvisionErrorState({
       </div>
       <div className="space-y-1">
         <p className="text-sm font-medium text-foreground">
-          Couldn&apos;t generate an inbox
+          Couldn&apos;t generate a mailbox
         </p>
         <p className="mx-auto max-w-xs text-xs text-muted">
           {message ?? "mail.tm is busy right now. Please try again."}

@@ -5,7 +5,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "@/components/ui/toaster";
-import { useAccountStore } from "@/store/account-store";
+import { useMailboxStore } from "@/store/mailbox-store";
+import { useSettingsStore } from "@/store/settings-store";
 
 /** Stable, memoized QueryClient for the whole app. */
 function makeQueryClient() {
@@ -27,7 +28,6 @@ let browserQueryClient: QueryClient | undefined;
 
 function getQueryClient() {
   if (typeof window === "undefined") {
-    // Server: always make a new client.
     return makeQueryClient();
   }
   if (!browserQueryClient) browserQueryClient = makeQueryClient();
@@ -38,15 +38,19 @@ function getQueryClient() {
  * Root client provider.
  *
  * Wires React Query, Radix tooltips, the toast viewport and hydrates the
- * persisted account from localStorage on first mount.
+ * persisted mailboxes + settings from localStorage on first mount.
  */
 export function Providers({ children }: { children: React.ReactNode }) {
   const queryClient = getQueryClient();
-  const hydrate = useAccountStore((s) => s.hydrate);
+  const hydrateMailboxes = useMailboxStore((s) => s.hydrate);
+  const hydrateSettings = useSettingsStore((s) => s.hydrate);
 
   React.useEffect(() => {
-    hydrate();
-  }, [hydrate]);
+    hydrateSettings();
+    // Prune mailboxes older than 7 days using the settings flag.
+    const { pruneExpiredEnabled } = useSettingsStore.getState();
+    hydrateMailboxes(pruneExpiredEnabled);
+  }, [hydrateMailboxes, hydrateSettings]);
 
   return (
     <QueryClientProvider client={queryClient}>
