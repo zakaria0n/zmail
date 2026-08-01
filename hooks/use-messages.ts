@@ -41,7 +41,7 @@ export function useMessages() {
     queryFn: async ({ signal }) => {
       if (!token) return [];
       const data = await mailtm.getMessages({ token, page: 1 }, signal);
-      return data["hydra:member"] ?? [];
+      return data; // getMessages already returns a normalized Message[]
     },
     enabled: Boolean(token),
     refetchInterval: token ? siteConfig.inboxRefreshIntervalMs : false,

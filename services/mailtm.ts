@@ -12,7 +12,6 @@
 import type {
   Account,
   Domain,
-  HydraCollection,
   MailTmError,
   Message,
   MessageDetail,
@@ -25,6 +24,23 @@ const JSON_HEADERS: Record<string, string> = {
   "Content-Type": "application/json",
   Accept: "application/json",
 };
+
+/**
+ * Normalizes a mail.tm list response into a plain array.
+ *
+ * mail.tm is content-negotiated: with an "application/json" Accept header it
+ * returns a bare array, while with a wildcard or "ld+json" accept it returns
+ * the Hydra envelope wrapping "hydra:member". Handle both so the client never
+ * depends on which shape arrives.
+ */
+function unwrapList<T>(payload: unknown): T[] {
+  if (Array.isArray(payload)) return payload as T[];
+  if (payload && typeof payload === "object" && "hydra:member" in payload) {
+    const member = (payload as Record<string, unknown>)["hydra:member"];
+    return Array.isArray(member) ? (member as T[]) : [];
+  }
+  return [];
+}
 
 type FetchOptions = {
   token?: string;
@@ -120,12 +136,13 @@ async function request<T>(path: string, options: FetchOptions = {}): Promise<T> 
 export const mailtm = {
   /** GET /domains — list of usable inbox domains. */
   async getDomains(signal?: AbortSignal): Promise<Domain[]> {
-    const data = await request<HydraCollection<Domain>>("/domains", {
+    const data = await request<unknown>("/domains", {
       signal,
       query: { page: 1 },
     });
-    const active = (data["hydra:member"] ?? []).filter((d) => d.isActive);
-    return active.length > 0 ? active : (data["hydra:member"] ?? []);
+    const all = unwrapList<Domain>(data);
+    const active = all.filter((d) => d.isActive);
+    return active.length > 0 ? active : all;
   },
 
   /** POST /accounts — create a new temporary mailbox. */
@@ -173,12 +190,13 @@ export const mailtm = {
   async getMessages(
     params: { token: string; page?: number },
     signal?: AbortSignal,
-  ): Promise<HydraCollection<Message>> {
-    return request<HydraCollection<Message>>("/messages", {
+  ): Promise<Message[]> {
+    const data = await request<unknown>("/messages", {
       token: params.token,
       query: { page: params.page ?? 1 },
       signal,
     });
+    return unwrapList<Message>(data);
   },
 
   /** GET /messages/{id} — fetch a single message with full body. */
