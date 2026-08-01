@@ -1,10 +1,15 @@
+"use client";
+
 /**
  * React Query hooks for the mail.tm inbox.
  *
- * - `useMessages` polls the inbox every 10s and keeps the unread badge in sync.
+ * - `useMessages` polls the ACTIVE mailbox's inbox and keeps the unread badge
+ *   in sync. On 401 it transparently re-authenticates with the saved password.
  * - `useMessageDetail` lazily fetches a single message's full body.
- * - `useMarkSeen`, `useDeleteMessage`, `useDeleteAccount` are mutations that
- *   keep the cache consistent.
+ * - `useMarkSeen`, `useDeleteMessage` are optimistic mutations.
+ *
+ * Queries are scoped per-mailbox via the active mailbox id, so switching
+ * mailboxes instantly loads that inbox's messages.
  */
 
 import { useEffect, useRef } from "react";
@@ -14,37 +19,74 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 
-import { siteConfig } from "@/config/site";
 import { queryKeys } from "@/hooks/query-keys";
+import { ensureValidToken } from "@/services/account";
 import { mailtm } from "@/services/mailtm";
-import { useAccountStore } from "@/store/account-store";
+import { useMailboxStore } from "@/store/mailbox-store";
+import { useSettingsStore } from "@/store/settings-store";
 import type { Message } from "@/types";
 
-/**
- * Reads the current token from the store.
- *
- * Returns `null` when no account exists yet (instead of throwing) so the
- * hooks can be safely rendered during SSR / before provisioning. The actual
- * network calls are gated behind `enabled`.
- */
-function useToken(): string | null {
-  return useAccountStore((s) => s.account?.token ?? null);
+/** The active mailbox (id + token), or null while none exists. */
+function useActiveMailbox() {
+  const activeId = useMailboxStore((s) => s.activeId);
+  const mailbox = useMailboxStore((s) =>
+    s.mailboxes.find((m) => m.id === s.activeId),
+  );
+  return { activeId, mailbox: mailbox ?? null };
 }
 
-/** Lists all messages for the active inbox, auto-refreshing every 10s. */
+/**
+ * Wraps an inbox fetch so a 401 triggers a transparent token refresh:
+ * re-authenticate with the saved password, patch the store, then retry once.
+ */
+async function fetchWithAutoLogin(
+  mailboxId: string,
+  token: string,
+  run: (token: string) => Promise<Message[]>,
+): Promise<Message[]> {
+  try {
+    return await run(token);
+  } catch (error) {
+    const status =
+      error instanceof Error && "status" in error
+        ? (error as { status: number }).status
+        : 0;
+    if (status !== 401) throw error;
+
+    // Token rejected → refresh from the store and retry once.
+    const current = useMailboxStore
+      .getState()
+      .mailboxes.find((m) => m.id === mailboxId);
+    if (!current) throw error;
+    const refreshed = await ensureValidToken(current);
+    if (refreshed.token !== current.token) {
+      useMailboxStore.getState().patchMailbox(mailboxId, {
+        token: refreshed.token,
+      });
+    }
+    return await run(refreshed.token);
+  }
+}
+
+/** Lists all messages for the active mailbox, auto-refreshing. */
 export function useMessages() {
-  const token = useToken();
-  const setUnreadCount = useAccountStore((s) => s.setUnreadCount);
+  const { activeId, mailbox } = useActiveMailbox();
+  const setUnreadCount = useMailboxStore((s) => s.setUnreadCount);
+  const autoRefresh = useSettingsStore((s) => s.autoRefreshEnabled);
+  const intervalMs = useSettingsStore((s) => s.refreshIntervalMs);
 
   const query = useQuery({
     queryKey: queryKeys.messages,
     queryFn: async ({ signal }) => {
-      if (!token) return [];
-      const data = await mailtm.getMessages({ token, page: 1 }, signal);
-      return data; // getMessages already returns a normalized Message[]
+      if (!mailbox) return [];
+      return fetchWithAutoLogin(mailbox.id, mailbox.token, async (token) => {
+        const data = await mailtm.getMessages({ token, page: 1 }, signal);
+        return data;
+      });
     },
-    enabled: Boolean(token),
-    refetchInterval: token ? siteConfig.inboxRefreshIntervalMs : false,
+    enabled: Boolean(mailbox),
+    refetchInterval:
+      mailbox && autoRefresh ? intervalMs : false,
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: true,
     staleTime: 5_000,
@@ -53,7 +95,7 @@ export function useMessages() {
   // Keep the unread badge in the global store in sync.
   const messages = query.data ?? [];
   const unread = messages.filter((m) => !m.seen).length;
-  useSyncUnread(unread, setUnreadCount);
+  useSyncUnread(unread, setUnreadCount, activeId);
 
   return {
     ...query,
@@ -62,46 +104,69 @@ export function useMessages() {
   };
 }
 
-/**
- * Mirrors the unread count into the global store via an effect, so the
- * header/badge always reflects the latest inbox state.
- */
-function useSyncUnread(unread: number, setUnreadCount: (n: number) => void) {
+/** Mirrors the unread count into the global store, resetting on switch. */
+function useSyncUnread(
+  unread: number,
+  setUnreadCount: (n: number) => void,
+  activeId: string | null,
+) {
+  const lastActive = useRef<string | null>(activeId);
   const last = useRef<number>(unread);
   useEffect(() => {
+    if (lastActive.current !== activeId) {
+      lastActive.current = activeId;
+      last.current = unread;
+      setUnreadCount(unread);
+      return;
+    }
     if (last.current !== unread) {
       last.current = unread;
       setUnreadCount(unread);
     }
-  }, [unread, setUnreadCount]);
+  }, [unread, setUnreadCount, activeId]);
 }
 
 /** Fetches a single message with its HTML / plain-text bodies. */
 export function useMessageDetail(id: string | null) {
-  const token = useToken();
+  const { mailbox } = useActiveMailbox();
 
   return useQuery({
     queryKey: queryKeys.message(id ?? "none"),
     queryFn: async ({ signal }) => {
-      if (!id || !token) {
-        throw new Error("No message selected or no active inbox.");
+      if (!id || !mailbox) {
+        throw new Error("No message selected or no active mailbox.");
       }
-      return mailtm.getMessage({ id, token }, signal);
+      try {
+        return await mailtm.getMessage({ id, token: mailbox.token }, signal);
+      } catch (error) {
+        const status =
+          error instanceof Error && "status" in error
+            ? (error as { status: number }).status
+            : 0;
+        if (status !== 401) throw error;
+        const refreshed = await ensureValidToken(mailbox);
+        if (refreshed.token !== mailbox.token) {
+          useMailboxStore.getState().patchMailbox(mailbox.id, {
+            token: refreshed.token,
+          });
+        }
+        return mailtm.getMessage({ id, token: refreshed.token }, signal);
+      }
     },
-    enabled: Boolean(id) && Boolean(token),
+    enabled: Boolean(id) && Boolean(mailbox),
     staleTime: 30_000,
   });
 }
 
-/** Marks a message as seen and updates the cache. */
+/** Marks a message as seen and updates the cache optimistically. */
 export function useMarkSeen() {
-  const token = useToken();
+  const { mailbox } = useActiveMailbox();
   const queryClient = useQueryClient();
 
   return useMutation({
     mutationFn: (id: string) => {
-      if (!token) throw new Error("No active inbox.");
-      return mailtm.markMessage({ id, token, seen: true });
+      if (!mailbox) throw new Error("No active mailbox.");
+      return mailtm.markMessage({ id, token: mailbox.token, seen: true });
     },
     onMutate: async (id: string) => {
       await queryClient.cancelQueries({ queryKey: queryKeys.messages });
@@ -122,15 +187,15 @@ export function useMarkSeen() {
   });
 }
 
-/** Deletes a message and removes it from the cache. */
+/** Deletes a message and removes it from the cache optimistically. */
 export function useDeleteMessage() {
-  const token = useToken();
+  const { mailbox } = useActiveMailbox();
   const queryClient = useQueryClient();
 
   return useMutation({
     mutationFn: (id: string) => {
-      if (!token) throw new Error("No active inbox.");
-      return mailtm.deleteMessage({ id, token });
+      if (!mailbox) throw new Error("No active mailbox.");
+      return mailtm.deleteMessage({ id, token: mailbox.token });
     },
     onMutate: async (id: string) => {
       await queryClient.cancelQueries({ queryKey: queryKeys.messages });
@@ -153,13 +218,13 @@ export function useDeleteMessage() {
 
 /** Marks every currently-unread message as seen. */
 export function useMarkAllSeen() {
-  const token = useToken();
+  const { mailbox } = useActiveMailbox();
   const queryClient = useQueryClient();
 
   return useMutation({
     mutationFn: (messages: Message[]) => {
-      if (!token) throw new Error("No active inbox.");
-      return mailtm.markAllSeen({ messages, token });
+      if (!mailbox) throw new Error("No active mailbox.");
+      return mailtm.markAllSeen({ messages, token: mailbox.token });
     },
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.messages });

@@ -1,15 +1,13 @@
 /**
  * Account orchestration service.
  *
- * Encapsulates the multi-step mail.tm provisioning flow so UI code only ever
- * calls `provisionAccount()` / `createNewAccount()`. Keeps the happy-path and
- * error handling logic in a single, well-tested location.
+ * Encapsulates the multi-step mail.tm provisioning flow and transparent token
+ * re-authentication so the UI only deals with `Mailbox` objects.
  */
 
 import { buildEmail, randomString, randomUsername } from "@/utils/email";
 import { mailtm } from "@/services/mailtm";
-import { clearAccount, saveAccount } from "@/utils/storage";
-import type { StoredAccount } from "@/types";
+import type { Domain, Mailbox } from "@/types";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -43,57 +41,42 @@ async function getTokenWithBackoff(
   );
 }
 
-/**
- * Provisions a brand new temporary inbox.
- *
- * Steps:
- *  1. Fetch the list of active domains.
- *  2. Generate a random username + strong password.
- *  3. Create the account on mail.tm.
- *  4. Exchange credentials for a JWT (with propagation backoff).
- *  5. Persist everything to localStorage and return it.
- */
-export async function provisionAccount(signal?: AbortSignal): Promise<StoredAccount> {
-  const domains = await mailtm.getDomains(signal);
-  if (domains.length === 0) {
-    throw new Error("No active mail.tm domains are available right now. Try again in a moment.");
-  }
-  const domain = domains[0]!.domain;
-
-  return createNewAccount(domain, signal);
+/** Fetches the list of usable (active) domains. */
+export async function fetchDomains(signal?: AbortSignal): Promise<Domain[]> {
+  return mailtm.getDomains(signal);
 }
 
 /**
- * Creates a new account against a specific domain.
+ * Provisions a brand-new mailbox against a chosen domain.
  *
  * Retries username generation if the chosen address is already taken
- * (HTTP 422/409), which is the most common transient failure when provisioning.
+ * (HTTP 422/409), the most common transient failure.
  */
-export async function createNewAccount(
-  domain: string,
+export async function provisionMailbox(
+  domain: Domain,
   signal?: AbortSignal,
-): Promise<StoredAccount> {
+): Promise<Mailbox> {
   const password = randomString(20);
 
   let lastError: unknown;
   for (let attempt = 0; attempt < 3; attempt++) {
-    const address = buildEmail(randomUsername(), domain);
+    const address = buildEmail(randomUsername(), domain.domain);
     try {
       const account = await mailtm.createAccount({ address, password }, signal);
       const token = await getTokenWithBackoff({ address, password }, signal);
 
-      const stored: StoredAccount = {
+      const mailbox: Mailbox = {
         id: account.id,
         address: account.address,
         password,
         token: token.token,
+        domain: domain.domain,
         createdAt: account.createdAt,
+        favorite: false,
       };
-      saveAccount(stored);
-      return stored;
+      return mailbox;
     } catch (error) {
       lastError = error;
-      // Only retry on address-in-use / validation conflicts.
       if (error instanceof Error && "status" in error) {
         const status = (error as { status: number }).status;
         if (status !== 422 && status !== 409) break;
@@ -103,14 +86,55 @@ export async function createNewAccount(
     }
   }
 
-  clearAccount();
   throw (
     lastError ??
     new Error("Failed to create a temporary inbox. Please try again.")
   );
 }
 
-/** Removes all locally stored credentials. */
-export function signOut(): void {
-  clearAccount();
+/**
+ * Provisions a mailbox against any active domain (auto-picks the first).
+ */
+export async function provisionMailboxAuto(signal?: AbortSignal): Promise<Mailbox> {
+  const domains = await fetchDomains(signal);
+  if (domains.length === 0) {
+    throw new Error(
+      "No active mail.tm domains are available right now. Try again in a moment.",
+    );
+  }
+  return provisionMailbox(domains[0]!, signal);
+}
+
+/**
+ * Transparently refreshes a mailbox's JWT if the stored token is rejected.
+ *
+ * Returns the mailbox with a valid token (re-authenticating with the saved
+ * password if needed). The caller should persist the refreshed token.
+ */
+export async function ensureValidToken(
+  mailbox: Mailbox,
+  signal?: AbortSignal,
+): Promise<Mailbox> {
+  // Fast path: probe the current token with a cheap /me call.
+  try {
+    await mailtm.getMe(mailbox.token, signal);
+    return mailbox;
+  } catch (error) {
+    const status =
+      error instanceof Error && "status" in error
+        ? (error as { status: number }).status
+        : 0;
+    if (status !== 401) {
+      // Network error or server fault — keep the existing token; let the
+      // caller surface its own error handling.
+      return mailbox;
+    }
+  }
+
+  // Token expired → request a fresh one with saved credentials.
+  const token = await getTokenWithBackoff(
+    { address: mailbox.address, password: mailbox.password },
+    signal,
+  );
+  return { ...mailbox, token: token.token };
 }
